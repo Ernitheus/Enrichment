@@ -42,11 +42,6 @@ def load_bmf_data():
         ignore_index=True,
     )
     combined_data.columns = combined_data.columns.str.lower().str.strip()
-
-    if "ein" not in combined_data.columns or "name" not in combined_data.columns:
-        st.error("Missing 'EIN' or 'name' column in BMF data.")
-        return pd.DataFrame()
-
     return combined_data
 
 # 🔍 Fuzzy Match Column
@@ -73,13 +68,19 @@ def clean_uploaded_data(uploaded_file):
 
 # 🚀 EIN Matching
 def match_eins_in_bmf(uploaded_df, org_name_column, bmf_data):
-    bmf_data["name"] = bmf_data["name"].str.lower().str.strip()
+    bmf_name_column = find_best_column_match(bmf_data.columns.tolist())
+
+    if bmf_name_column is None or "ein" not in bmf_data.columns:
+        st.error("❌ Required columns not found in IRS BMF data.")
+        return uploaded_df
+
+    bmf_data[bmf_name_column] = bmf_data[bmf_name_column].str.lower().str.strip()
     uploaded_df[org_name_column] = uploaded_df[org_name_column].str.lower().str.strip()
 
     enriched = uploaded_df.merge(
-        bmf_data[['name', 'ein', 'ntee_cd', 'revenue_amt', 'income_amt', 'asset_amt']],
+        bmf_data[[bmf_name_column, 'ein', 'ntee_cd', 'revenue_amt', 'income_amt', 'asset_amt']],
         left_on=org_name_column,
-        right_on='name',
+        right_on=bmf_name_column,
         how='left'
     )
     enriched.rename(columns={"ein": "EIN"}, inplace=True)
@@ -126,13 +127,15 @@ async def fetch_all_propublica(ein_list):
 st.set_page_config(page_title="Nonprofit Enrichment Tool", layout="wide")
 st.title("🚀 Nonprofit Data Enrichment Tool")
 
-# Download IRS BMF files if not present
+# Step 1: Download and load BMF
 download_and_extract_bmf()
-
-# Load the IRS data
 bmf_data = load_bmf_data()
 
-# ✅ ProPublica Test
+# Optional Debug: show IRS columns
+if st.checkbox("🔍 Show IRS BMF Columns"):
+    st.write(bmf_data.columns.tolist())
+
+# Step 2: ProPublica test
 if st.button("🔍 Test ProPublica API"):
     test_ein = "131624102"  # American Red Cross
     result = asyncio.run(fetch_all_propublica([test_ein]))
@@ -142,7 +145,7 @@ if st.button("🔍 Test ProPublica API"):
     else:
         st.error("❌ Failed to fetch data from ProPublica API.")
 
-# File Upload
+# Step 3: Upload file
 uploaded_csv = st.file_uploader("📤 Upload a CSV File with Organization Names", type=["csv"])
 
 if uploaded_csv is not None:
