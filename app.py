@@ -14,7 +14,7 @@ IRS_ZIP_URL = "https://apps.irs.gov/pub/epostcard/data-download-pub78.zip"
 BMF_FOLDER_PATH = "IRS_EO_BMF"
 PROPUBLICA_API_URL = "https://projects.propublica.org/nonprofits/api/v2/organizations/"
 
-# 🚀 Download & Extract IRS BMF ZIP
+# 🧩 Download IRS BMF file if needed
 def download_and_extract_bmf():
     if not os.path.exists(BMF_FOLDER_PATH) or not os.listdir(BMF_FOLDER_PATH):
         st.info("📦 Downloading latest IRS BMF data...")
@@ -29,7 +29,7 @@ def download_and_extract_bmf():
         except Exception as e:
             st.error(f"❌ Download error: {e}")
 
-# 🚀 Load IRS BMF Data
+# 🧩 Load IRS BMF Data
 @st.cache_data
 def load_bmf_data():
     csv_files = glob.glob(os.path.join(BMF_FOLDER_PATH, "*.csv"))
@@ -44,73 +44,64 @@ def load_bmf_data():
     combined_data.columns = combined_data.columns.str.lower().str.strip()
     return combined_data
 
-# 🔍 Fuzzy Match Column
-def find_best_column_match(possible_columns):
-    if not possible_columns:
+# 🧠 Find best-matching name column
+def find_best_column_match(columns):
+    if not columns:
         return None
-
     keywords = ["company", "organization", "name", "nonprofit", "business", "entity"]
-    normalized = [col.lower().strip() for col in possible_columns]
-
+    normalized = [col.lower().strip() for col in columns]
     try:
         for keyword in keywords:
             result = process.extractOne(keyword, normalized)
             if result:
                 match, score = result
                 if score >= 60:
-                    return possible_columns[normalized.index(match)]
+                    return columns[normalized.index(match)]
     except Exception as e:
         st.warning(f"Fuzzy match failed: {e}")
-    
-    return possible_columns[0] if possible_columns else None
+    return columns[0]
 
-# 🚀 Clean Uploaded Data
+# 🧼 Clean Uploaded Data
 def clean_uploaded_data(uploaded_file):
     uploaded_data = pd.read_csv(uploaded_file, dtype=str)
-    if uploaded_data.empty:
-        st.error("❌ Uploaded file is empty.")
-        return None, None
-
     uploaded_data.columns = uploaded_data.columns.str.lower().str.strip()
     org_name_column = find_best_column_match(uploaded_data.columns.tolist())
-    if org_name_column is None:
-        st.error("❌ Could not find a name column in uploaded data.")
-        return None, None
-
     uploaded_data[org_name_column] = uploaded_data[org_name_column].str.lower().str.strip()
     return uploaded_data, org_name_column
 
-# 🚀 EIN Matching
-def match_eins_in_bmf(uploaded_df, org_name_column, bmf_data):
-    bmf_name_column = find_best_column_match(bmf_data.columns.tolist())
-
-    if not bmf_name_column or "ein" not in bmf_data.columns:
-        st.error("❌ Required columns not found in IRS BMF data.")
-        return uploaded_df
-
-    bmf_data[bmf_name_column] = bmf_data[bmf_name_column].str.lower().str.strip()
-    uploaded_df[org_name_column] = uploaded_df[org_name_column].str.lower().str.strip()
-
-    enriched = uploaded_df.merge(
-        bmf_data[[bmf_name_column, 'ein', 'ntee_cd', 'revenue_amt', 'income_amt', 'asset_amt']],
+# 🔍 Try exact EIN match first
+def match_eins_exact(uploaded_df, org_name_column, bmf_df, bmf_name_col):
+    bmf_df[bmf_name_col] = bmf_df[bmf_name_col].str.lower().str.strip()
+    return uploaded_df.merge(
+        bmf_df[[bmf_name_col, 'ein', 'ntee_cd', 'revenue_amt', 'income_amt', 'asset_amt']],
         left_on=org_name_column,
-        right_on=bmf_name_column,
+        right_on=bmf_name_col,
         how='left'
     )
-    enriched.rename(columns={"ein": "EIN"}, inplace=True)
-    return enriched
 
-# 🚀 Deduplicate Data
-def deduplicate_data(df, org_name_column):
-    if "EIN" in df.columns:
-        df = df.sort_values(by=["EIN", "revenue_amt"], ascending=[True, False])
-        df = df.drop_duplicates(subset=["EIN"], keep="first")
-    if org_name_column in df.columns:
-        df = df.sort_values(by=["EIN", "revenue_amt"], ascending=[True, False])
-        df = df.drop_duplicates(subset=[org_name_column], keep="first")
-    return df
+# 🔍 Fuzzy match fallback
+def fuzzy_match_unmatched(uploaded_df, org_name_column, bmf_df, bmf_name_col):
+    def get_best_ein(org_name):
+        match, score = process.extractOne(org_name, bmf_df[bmf_name_col].dropna().unique(), scorer=process.default_scorer)
+        if score >= 85:
+            matched_row = bmf_df[bmf_df[bmf_name_col] == match].iloc[0]
+            return pd.Series({
+                'ein': matched_row.get('ein'),
+                'ntee_cd': matched_row.get('ntee_cd'),
+                'revenue_amt': matched_row.get('revenue_amt'),
+                'income_amt': matched_row.get('income_amt'),
+                'asset_amt': matched_row.get('asset_amt'),
+            })
+        return pd.Series({'ein': None, 'ntee_cd': None, 'revenue_amt': None, 'income_amt': None, 'asset_amt': None})
 
-# 🚀 Async API Request
+    no_ein_mask = uploaded_df['ein'].isna()
+    fuzzy_matched = uploaded_df[no_ein_mask].copy()
+    matched_data = fuzzy_matched[org_name_column].apply(get_best_ein)
+    for col in matched_data.columns:
+        uploaded_df.loc[no_ein_mask, col] = matched_data[col]
+    return uploaded_df
+
+# 🚀 Async ProPublica EIN enrichment
 async def fetch_propublica_async(session, ein):
     url = f"{PROPUBLICA_API_URL}{ein}.json"
     try:
@@ -134,68 +125,64 @@ async def fetch_propublica_async(session, ein):
 
 async def fetch_all_propublica(ein_list):
     async with aiohttp.ClientSession() as session:
-        tasks = [fetch_propublica_async(session, ein) for ein in ein_list if ein and ein != "N/A"]
+        tasks = [fetch_propublica_async(session, ein) for ein in ein_list if ein]
         return await asyncio.gather(*tasks)
 
-# 🚀 Streamlit App UI
-st.set_page_config(page_title="Nonprofit Enrichment Tool", layout="wide")
-st.title("🚀 Nonprofit Data Enrichment Tool")
+# ✅ Deduplication
+def deduplicate(df, org_name_column):
+    sort_cols = ["ein"]
+    if "revenue_amt" in df.columns:
+        sort_cols.append("revenue_amt")
+    try:
+        df = df.sort_values(by=sort_cols, ascending=[True] + [False] * (len(sort_cols) - 1))
+    except:
+        pass
+    df = df.drop_duplicates(subset=["ein"], keep="first")
+    df = df.drop_duplicates(subset=[org_name_column], keep="first")
+    return df
 
-# Step 1: Download and load BMF
+# 🌐 Streamlit UI
+st.set_page_config(page_title="Nonprofit Enrichment Tool", layout="wide")
+st.title("🚀 Nonprofit Enrichment Tool with BMF + ProPublica")
+
+# Step 1: Load BMF
 download_and_extract_bmf()
 bmf_data = load_bmf_data()
+bmf_name_col = find_best_column_match(bmf_data.columns.tolist())
 
-# Optional Debug: show IRS columns
-if st.checkbox("🔍 Show IRS BMF Columns"):
-    st.write(bmf_data.columns.tolist())
+# Step 2: File Upload
+uploaded_file = st.file_uploader("📤 Upload CSV with Organization Names Only", type=["csv"])
+if uploaded_file:
+    uploaded_df, org_name_column = clean_uploaded_data(uploaded_file)
+    st.subheader("📄 Uploaded Preview")
+    st.dataframe(uploaded_df.head())
 
-# Step 2: ProPublica test
-if st.button("🔍 Test ProPublica API"):
-    test_ein = "131624102"  # American Red Cross
+    if st.button("🚀 Enrich Now"):
+        st.info("Step 1️⃣: Matching EINs from IRS...")
+        enriched_df = match_eins_exact(uploaded_df, org_name_column, bmf_data, bmf_name_col)
+
+        st.info("Step 2️⃣: Fuzzy fallback EIN matching...")
+        enriched_df = fuzzy_match_unmatched(enriched_df, org_name_column, bmf_data, bmf_name_col)
+        enriched_df.rename(columns={"ein": "EIN"}, inplace=True)
+
+        st.info("Step 3️⃣: ProPublica EIN enrichment...")
+        eins_to_fetch = enriched_df["EIN"].dropna().unique().tolist()
+        propublica_results = asyncio.run(fetch_all_propublica(eins_to_fetch))
+        pro_df = pd.DataFrame([row for row in propublica_results if row])
+
+        if not pro_df.empty:
+            enriched_df = enriched_df.merge(pro_df, on="EIN", how="left")
+
+        enriched_df = deduplicate(enriched_df, org_name_column)
+
+        st.success("✅ Enrichment Complete!")
+        st.dataframe(enriched_df.head())
+
+        csv = enriched_df.to_csv(index=False).encode('utf-8')
+        st.download_button("📥 Download Enriched CSV", data=csv, file_name="enriched_data.csv", mime="text/csv")
+
+# Optional ProPublica test
+if st.button("🔎 Test ProPublica API (Red Cross)"):
+    test_ein = "131624102"
     result = asyncio.run(fetch_all_propublica([test_ein]))
-    if result and result[0]:
-        st.success("✅ ProPublica API is working!")
-        st.json(result[0])
-    else:
-        st.error("❌ Failed to fetch data from ProPublica API.")
-
-# Step 3: Upload file
-uploaded_csv = st.file_uploader("📤 Upload a CSV File with Organization Names Only", type=["csv"])
-
-if uploaded_csv is not None:
-    uploaded_data, org_name_column = clean_uploaded_data(uploaded_csv)
-    if uploaded_data is not None:
-        st.subheader("📄 Preview Uploaded Data")
-        st.dataframe(uploaded_data.head())
-
-        if st.button("🚀 Enrich Data"):
-            st.info("🔄 Matching EINs with IRS BMF...")
-            enriched_data = match_eins_in_bmf(uploaded_data, org_name_column, bmf_data)
-
-            if "EIN" not in enriched_data.columns:
-                enriched_data["EIN"] = "N/A"
-
-            eins_to_fetch = enriched_data["EIN"].dropna().unique().tolist()
-            eins_to_fetch = [ein for ein in eins_to_fetch if ein != "N/A"]
-
-            st.info("🔄 Fetching additional data from ProPublica...")
-            propublica_data = asyncio.run(fetch_all_propublica(eins_to_fetch))
-            propublica_df = pd.DataFrame([item for item in propublica_data if item])
-
-            if not propublica_df.empty:
-                enriched_data = enriched_data.merge(propublica_df, on="EIN", how="left")
-            else:
-                st.warning("⚠️ No additional data found via ProPublica.")
-
-            enriched_data = deduplicate_data(enriched_data, org_name_column)
-
-            st.success("✅ Enrichment Complete!")
-            st.dataframe(enriched_data.head())
-
-            csv = enriched_data.to_csv(index=False).encode('utf-8')
-            st.download_button(
-                label="📥 Download Enriched CSV",
-                data=csv,
-                file_name="enriched_data.csv",
-                mime="text/csv"
-            )
+    st.json(result[0] if result else "No data")
