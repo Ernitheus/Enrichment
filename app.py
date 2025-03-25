@@ -69,8 +69,12 @@ def clean_uploaded_data(uploaded_file):
     uploaded_data[org_name_column] = uploaded_data[org_name_column].str.lower().str.strip()
     return uploaded_data, org_name_column
 
-# 🔍 Try exact EIN match first
+# 🔍 EIN match
 def match_eins_exact(uploaded_df, org_name_column, bmf_df, bmf_name_col):
+    if bmf_name_col not in bmf_df.columns:
+        st.error(f"❌ IRS BMF column '{bmf_name_col}' not found.")
+        st.stop()
+
     bmf_df[bmf_name_col] = bmf_df[bmf_name_col].str.lower().str.strip()
     return uploaded_df.merge(
         bmf_df[[bmf_name_col, 'ein', 'ntee_cd', 'revenue_amt', 'income_amt', 'asset_amt']],
@@ -78,28 +82,6 @@ def match_eins_exact(uploaded_df, org_name_column, bmf_df, bmf_name_col):
         right_on=bmf_name_col,
         how='left'
     )
-
-# 🔍 Fuzzy match fallback
-def fuzzy_match_unmatched(uploaded_df, org_name_column, bmf_df, bmf_name_col):
-    def get_best_ein(org_name):
-        match, score = process.extractOne(org_name, bmf_df[bmf_name_col].dropna().unique(), scorer=process.default_scorer)
-        if score >= 85:
-            matched_row = bmf_df[bmf_df[bmf_name_col] == match].iloc[0]
-            return pd.Series({
-                'ein': matched_row.get('ein'),
-                'ntee_cd': matched_row.get('ntee_cd'),
-                'revenue_amt': matched_row.get('revenue_amt'),
-                'income_amt': matched_row.get('income_amt'),
-                'asset_amt': matched_row.get('asset_amt'),
-            })
-        return pd.Series({'ein': None, 'ntee_cd': None, 'revenue_amt': None, 'income_amt': None, 'asset_amt': None})
-
-    no_ein_mask = uploaded_df['ein'].isna()
-    fuzzy_matched = uploaded_df[no_ein_mask].copy()
-    matched_data = fuzzy_matched[org_name_column].apply(get_best_ein)
-    for col in matched_data.columns:
-        uploaded_df.loc[no_ein_mask, col] = matched_data[col]
-    return uploaded_df
 
 # 🚀 Async ProPublica EIN enrichment
 async def fetch_propublica_async(session, ein):
@@ -148,7 +130,10 @@ st.title("🚀 Nonprofit Enrichment Tool with BMF + ProPublica")
 # Step 1: Load BMF
 download_and_extract_bmf()
 bmf_data = load_bmf_data()
-bmf_name_col = find_best_column_match(bmf_data.columns.tolist())
+st.write("📄 IRS BMF Columns:", bmf_data.columns.tolist())  # Show IRS column names
+
+# 🛠 Hardcoded fix — override fuzzy logic
+bmf_name_col = "name"  # If this doesn't work, update to match what you see in the columns printed above
 
 # Step 2: File Upload
 uploaded_file = st.file_uploader("📤 Upload CSV with Organization Names Only", type=["csv"])
@@ -160,12 +145,9 @@ if uploaded_file:
     if st.button("🚀 Enrich Now"):
         st.info("Step 1️⃣: Matching EINs from IRS...")
         enriched_df = match_eins_exact(uploaded_df, org_name_column, bmf_data, bmf_name_col)
-
-        st.info("Step 2️⃣: Fuzzy fallback EIN matching...")
-        enriched_df = fuzzy_match_unmatched(enriched_df, org_name_column, bmf_data, bmf_name_col)
         enriched_df.rename(columns={"ein": "EIN"}, inplace=True)
 
-        st.info("Step 3️⃣: ProPublica EIN enrichment...")
+        st.info("Step 2️⃣: ProPublica EIN enrichment...")
         eins_to_fetch = enriched_df["EIN"].dropna().unique().tolist()
         propublica_results = asyncio.run(fetch_all_propublica(eins_to_fetch))
         pro_df = pd.DataFrame([row for row in propublica_results if row])
@@ -180,9 +162,3 @@ if uploaded_file:
 
         csv = enriched_df.to_csv(index=False).encode('utf-8')
         st.download_button("📥 Download Enriched CSV", data=csv, file_name="enriched_data.csv", mime="text/csv")
-
-# Optional ProPublica test
-if st.button("🔎 Test ProPublica API (Red Cross)"):
-    test_ein = "131624102"
-    result = asyncio.run(fetch_all_propublica([test_ein]))
-    st.json(result[0] if result else "No data")
