@@ -46,12 +46,22 @@ def load_bmf_data():
 
 # 🔍 Fuzzy Match Column
 def find_best_column_match(possible_columns):
+    if not possible_columns:
+        return None
+
     keywords = ["company", "organization", "name", "nonprofit", "business", "entity"]
     normalized = [col.lower().strip() for col in possible_columns]
-    for keyword in keywords:
-        match, score = process.extractOne(keyword, normalized)
-        if score >= 60:
-            return possible_columns[normalized.index(match)]
+
+    try:
+        for keyword in keywords:
+            result = process.extractOne(keyword, normalized)
+            if result:
+                match, score = result
+                if score >= 60:
+                    return possible_columns[normalized.index(match)]
+    except Exception as e:
+        st.warning(f"Fuzzy match failed: {e}")
+    
     return possible_columns[0] if possible_columns else None
 
 # 🚀 Clean Uploaded Data
@@ -63,6 +73,10 @@ def clean_uploaded_data(uploaded_file):
 
     uploaded_data.columns = uploaded_data.columns.str.lower().str.strip()
     org_name_column = find_best_column_match(uploaded_data.columns.tolist())
+    if org_name_column is None:
+        st.error("❌ Could not find a name column in uploaded data.")
+        return None, None
+
     uploaded_data[org_name_column] = uploaded_data[org_name_column].str.lower().str.strip()
     return uploaded_data, org_name_column
 
@@ -70,7 +84,7 @@ def clean_uploaded_data(uploaded_file):
 def match_eins_in_bmf(uploaded_df, org_name_column, bmf_data):
     bmf_name_column = find_best_column_match(bmf_data.columns.tolist())
 
-    if bmf_name_column is None or "ein" not in bmf_data.columns:
+    if not bmf_name_column or "ein" not in bmf_data.columns:
         st.error("❌ Required columns not found in IRS BMF data.")
         return uploaded_df
 
@@ -146,7 +160,7 @@ if st.button("🔍 Test ProPublica API"):
         st.error("❌ Failed to fetch data from ProPublica API.")
 
 # Step 3: Upload file
-uploaded_csv = st.file_uploader("📤 Upload a CSV File with Organization Names", type=["csv"])
+uploaded_csv = st.file_uploader("📤 Upload a CSV File with Organization Names Only", type=["csv"])
 
 if uploaded_csv is not None:
     uploaded_data, org_name_column = clean_uploaded_data(uploaded_csv)
