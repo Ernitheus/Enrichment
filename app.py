@@ -9,12 +9,10 @@ import zipfile
 import io
 from fuzzywuzzy import process
 
-# === Constants ===
 IRS_ZIP_URL = "https://apps.irs.gov/pub/epostcard/data-download-pub78.zip"
 BMF_FOLDER_PATH = "IRS_EO_BMF"
 PROPUBLICA_API_URL = "https://projects.propublica.org/nonprofits/api/v2/organizations/"
 
-# === Download IRS BMF ZIP and extract ===
 def download_and_extract_bmf():
     if not os.path.exists(BMF_FOLDER_PATH) or not os.listdir(BMF_FOLDER_PATH):
         st.info("📦 Downloading IRS BMF data...")
@@ -29,30 +27,37 @@ def download_and_extract_bmf():
         except Exception as e:
             st.error(f"❌ Download error: {e}")
 
-# === Load BMF with safe fallback ===
 @st.cache_data
 def load_bmf_data():
     files = glob.glob(os.path.join(BMF_FOLDER_PATH, "*"))
     if not files:
+        st.warning("⚠️ No files found in extracted IRS BMF folder.")
         return pd.DataFrame()
+
+    st.write("📁 Extracted files:", files)
 
     all_data = []
     for file in files:
         if file.endswith(".csv") or file.endswith(".txt"):
             try:
-                df = pd.read_csv(file, dtype=str, sep=None, engine="python")  # Fixed
+                st.write(f"🔍 Trying to read: {file}")
+                df_preview = pd.read_csv(file, dtype=str, sep=None, engine="python", nrows=5)
+                st.write("✅ File preview:")
+                st.dataframe(df_preview)
+
+                df = pd.read_csv(file, dtype=str, sep=None, engine="python")
                 all_data.append(df)
             except Exception as e:
                 st.warning(f"⚠️ Skipping file: {file} — {e}")
 
     if not all_data:
+        st.warning("⚠️ No usable IRS BMF files loaded.")
         return pd.DataFrame()
 
     combined = pd.concat(all_data, ignore_index=True)
     combined.columns = combined.columns.str.lower().str.strip()
     return combined
 
-# === Auto-detect name column ===
 def get_bmf_name_col(columns):
     preferred = ["name", "organizationname", "org_name", "orgname", "entityname"]
     for col in preferred:
@@ -64,7 +69,6 @@ def get_bmf_name_col(columns):
         return match if score >= 60 else None
     return None
 
-# === Clean uploaded data ===
 def clean_uploaded_data(uploaded_file):
     df = pd.read_csv(uploaded_file, dtype=str)
     df.columns = df.columns.str.lower().str.strip()
@@ -72,7 +76,6 @@ def clean_uploaded_data(uploaded_file):
     df[org_col] = df[org_col].str.lower().str.strip()
     return df, org_col
 
-# === Match EIN from IRS ===
 def match_eins(uploaded_df, org_col, bmf_df, bmf_name_col):
     bmf_df[bmf_name_col] = bmf_df[bmf_name_col].str.lower().str.strip()
     return uploaded_df.merge(
@@ -82,7 +85,6 @@ def match_eins(uploaded_df, org_col, bmf_df, bmf_name_col):
         how='left'
     )
 
-# === ProPublica EIN Enrichment ===
 async def fetch_propublica_async(session, ein):
     url = f"{PROPUBLICA_API_URL}{ein}.json"
     try:
@@ -109,18 +111,17 @@ async def fetch_all_propublica(eins):
         tasks = [fetch_propublica_async(session, ein) for ein in eins if ein and ein != "N/A"]
         return await asyncio.gather(*tasks)
 
-# === Deduplicate ===
 def deduplicate(df, org_col):
     df = df.sort_values(by=["ein"], ascending=True)
     df = df.drop_duplicates(subset=["ein"], keep="first")
     df = df.drop_duplicates(subset=[org_col], keep="first")
     return df
 
-# === Streamlit App ===
+# Streamlit App UI
 st.set_page_config(page_title="Nonprofit Enrichment Tool", layout="wide")
 st.title("🚀 Nonprofit Enrichment Tool (IRS BMF + ProPublica)")
 
-# Step 1: Download & Load BMF
+# Step 1: Download IRS BMF
 download_and_extract_bmf()
 bmf_data = load_bmf_data()
 
