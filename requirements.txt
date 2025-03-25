@@ -1,0 +1,6 @@
+streamlit
+pandas
+aiohttp
+requests
+fuzzywuzzy
+python-Levenshtein
