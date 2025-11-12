@@ -1,4 +1,4 @@
-# app.py — ultra-stable, no network, no external scrapers
+# app.py — ultra-stable, session_state-safe, no network
 import os, re, zipfile
 from pathlib import Path
 
@@ -12,10 +12,17 @@ APP_TITLE = "🚀 Nonprofit Enrichment Tool (Local IRS only – ultra stable)"
 BMF_DEFAULT_FOLDER = "IRS_EO_BMF"   # we also scan repo root
 MAX_PREVIEW_ROWS = 200
 
+# -------------------- session_state init --------------------
+for k, v in {
+    "bmf_ready": False,
+    "bmf_data": None,
+    "bmf_name_col": None,
+}.items():
+    if k not in st.session_state:
+        st.session_state[k] = v
+
 # -------------------- helpers (no external deps) --------------------
 def _extract_one(query, choices):
-    # extremely safe fallback, no rapidfuzz dependency
-    # prefer exact/contains "name"
     choices = list(choices)
     q = query.lower()
     exact = [c for c in choices if c.lower() == q]
@@ -37,14 +44,12 @@ def get_best_name_col(columns):
 
 def normalize_bmf_columns(df: pd.DataFrame) -> pd.DataFrame:
     df = df.copy()
-    # map common variants into expected columns
     col_map = {
         "ein": ["ein", "ein number", "einnum", "ein_number"],
         "ntee_cd": ["ntee_cd", "ntee", "ntee_code"],
         "revenue_amt": ["revenue_amt", "revenue", "totrevenue", "total_revenue"],
         "income_amt": ["income_amt", "income", "netincome", "net_income"],
         "asset_amt": ["asset_amt", "assets", "totalassets", "total_assets"],
-        # sometimes org name differs in BMF dumps:
         "organizationname": ["organizationname", "orgname", "name", "entityname"],
         "state": ["state", "state_cd", "st", "stateabbr", "state_abbr"],
         "city": ["city", "town", "locality", "mailingcity", "mailing_city"],
@@ -54,7 +59,8 @@ def normalize_bmf_columns(df: pd.DataFrame) -> pd.DataFrame:
         if canonical not in df.columns:
             for v in variants:
                 if v in df.columns:
-                    df[canonical] = df[v]; break
+                    df[canonical] = df[v]
+                    break
             if canonical not in df.columns:
                 df[canonical] = None
     return df
@@ -141,7 +147,7 @@ def dedupe(df, org_col):
         out = out.drop_duplicates(subset=[org_col], keep="first")
     return out
 
-# ------------ domain "best guess" (no network, ultra-safe) ------------
+# ------------ domain "best guess" (no network) ------------
 def _norm(s: str) -> str:
     return re.sub(r"\s+", " ", str(s or "")).strip()
 
@@ -153,11 +159,9 @@ def _slugify_name(name: str) -> str:
     return n[:63]
 
 def guess_domain_from_name(name: str) -> str:
-    """Zero-network domain guess. Tries .org first, then .com."""
+    """Zero-network domain guess. Tries .org only (simple & stable)."""
     base = _slugify_name(name)
-    if not base:
-        return ""
-    return base + ".org"  # simple and safe; users can edit later if needed
+    return (base + ".org") if base else ""
 
 # --------------------- UI (SAFE) -----------------------
 st.title(APP_TITLE)
@@ -189,15 +193,27 @@ if st.button("📂 Scan BMF files now"):
         bmf_data, bmf_read_files = scan_bmf(bmf_folder_input)
     if bmf_data.empty:
         st.error("No BMF files found or parsable in IRS_EO_BMF/ or repo root.")
+        # reset state on failure
+        st.session_state["bmf_ready"] = False
+        st.session_state["bmf_data"] = None
+        st.session_state["bmf_name_col"] = None
     else:
+        bmf_data = normalize_bmf_columns(bmf_data)
+        bmf_name_col = get_best_name_col(bmf_data.columns) or "organizationname"
         st.success(f"BMF ready: {len(bmf_data):,} rows from {len(bmf_read_files)} file(s).")
+        st.session_state["bmf_data"] = bmf_data
+        st.session_state["bmf_name_col"] = bmf_name_col
         st.session_state["bmf_ready"] = True
-        st.session_state["bmf_data"] = normalize_bmf_columns(bmf_data)
-        st.session_state["bmf_name_col"] = get_best_name_col(bmf_data.columns)
 
-bmf_ready = st.session_state.get("bmf_ready", False)
+# recompute readiness strictly (all keys must exist)
+bmf_ready = bool(
+    st.session_state.get("bmf_ready")
+    and st.session_state.get("bmf_data") is not None
+    and st.session_state.get("bmf_name_col")
+)
+
 if bmf_ready:
-    st.info(f"BMF loaded • using name column: **{st.session_state['bmf_name_col']}**")
+    st.info(f"BMF loaded • using name column: **{st.session_state.get('bmf_name_col')}**")
 else:
     st.warning("BMF not loaded yet. Click **Scan BMF files now** when ready.")
 
@@ -210,42 +226,42 @@ if st.button("🚀 Enrich Now"):
         elif not bmf_ready:
             st.error("Please load BMF data first (click **Scan BMF files now**).")
         else:
-            bmf_data = st.session_state["bmf_data"]
-            bmf_name_col = st.session_state["bmf_name_col"]
+            bmf_data = st.session_state.get("bmf_data")
+            bmf_name_col = st.session_state.get("bmf_name_col")
 
-            st.info("🔎 Matching EINs locally...")
-            enriched = match_eins(uploaded_df, org_col, bmf_data, bmf_name_col)
-            if "ein" in enriched.columns:
-                enriched.rename(columns={"ein": "EIN"}, inplace=True)
-
-            enriched = dedupe(enriched, org_col)
-
-            # Domain guess column (ultra-safe)
-            # 1) If a website field already exists from BMF, keep it (raw).
-            if "website" in enriched.columns:
-                enriched["WebsiteRaw"] = enriched["website"]
+            if bmf_data is None or not bmf_name_col:
+                st.error("BMF data is not available in session. Please scan again.")
             else:
-                enriched["WebsiteRaw"] = ""
+                st.info("🔎 Matching EINs locally...")
+                enriched = match_eins(uploaded_df, org_col, bmf_data, bmf_name_col)
+                if "ein" in enriched.columns:
+                    enriched.rename(columns={"ein": "EIN"}, inplace=True)
 
-            # 2) Create a best-guess domain purely from name (no network)
-            # prefer the uploaded org name if present, else BMF name
-            name_for_guess = org_col
-            if name_for_guess not in enriched.columns and bmf_name_col in enriched.columns:
-                name_for_guess = bmf_name_col
+                enriched = dedupe(enriched, org_col)
 
-            if name_for_guess in enriched.columns:
-                enriched["WebsiteGuess"] = enriched[name_for_guess].fillna("").apply(guess_domain_from_name)
-            else:
-                enriched["WebsiteGuess"] = ""
+                # Website raw (if present in BMF)
+                if "website" in enriched.columns:
+                    enriched["WebsiteRaw"] = enriched["website"]
+                else:
+                    enriched["WebsiteRaw"] = ""
 
-            st.success("✅ Enrichment complete!")
-            st.dataframe(enriched.head(MAX_PREVIEW_ROWS), use_container_width=True)
-            st.download_button(
-                "📥 Download Enriched CSV",
-                data=enriched.to_csv(index=False).encode("utf-8"),
-                file_name="enriched_data.csv",
-                mime="text/csv",
-            )
+                # Best-guess domain from the name (no network)
+                name_for_guess = org_col if org_col in enriched.columns else (
+                    bmf_name_col if bmf_name_col in enriched.columns else None
+                )
+                if name_for_guess:
+                    enriched["WebsiteGuess"] = enriched[name_for_guess].fillna("").apply(guess_domain_from_name)
+                else:
+                    enriched["WebsiteGuess"] = ""
+
+                st.success("✅ Enrichment complete!")
+                st.dataframe(enriched.head(MAX_PREVIEW_ROWS), use_container_width=True)
+                st.download_button(
+                    "📥 Download Enriched CSV",
+                    data=enriched.to_csv(index=False).encode("utf-8"),
+                    file_name="enriched_data.csv",
+                    mime="text/csv",
+                )
     except Exception as e:
         st.error("The enrichment step encountered an error (details below).")
         st.exception(e)
