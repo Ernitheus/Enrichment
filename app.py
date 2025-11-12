@@ -1,21 +1,18 @@
-# app.py
-import streamlit as st
-import pandas as pd
-import asyncio
-import aiohttp
+import os
 from pathlib import Path
 import zipfile
-import os
+import asyncio
+import pandas as pd
+import streamlit as st
 
-# ---------------- Config ----------------
+# ---- Config ----
 PROPUBLICA_API_URL = "https://projects.propublica.org/nonprofits/api/v2/organizations/"
-BMF_DEFAULT_FOLDER = "IRS_EO_BMF"   # we'll also scan repo root
-# ----------------------------------------
+BMF_DEFAULT_FOLDER = "IRS_EO_BMF"   # we also scan repo root
 
 st.set_page_config(page_title="Nonprofit Enrichment Tool", layout="wide")
 st.title("🚀 Nonprofit Enrichment Tool (Local IRS + ProPublica)")
 
-# ----------- Helpers (fuzzy col match) -----------
+# ---- Optional deps (don’t crash if missing) ----
 def _extract_one(query, choices):
     try:
         from rapidfuzz import process as rf_process, fuzz as rf_fuzz
@@ -23,13 +20,14 @@ def _extract_one(query, choices):
         if m: return m[0], int(m[1])
     except Exception:
         try:
-            from fuzzywuzzy import process as fw_process
+            from fuzzywuzzy import process as fw_process  # only if you added it
             m = fw_process.extractOne(query, choices)
             if m: return m[0], int(m[1])
         except Exception:
             pass
     return (choices[0], 0) if choices else (None, 0)
 
+# ---- Utilities ----
 def get_best_name_col(columns):
     preferred = ["name", "organizationname", "orgname", "entityname", "organization_name"]
     cols = list(columns)
@@ -58,9 +56,9 @@ def normalize_bmf_columns(df: pd.DataFrame) -> pd.DataFrame:
                 df[canonical] = None
     return df
 
-# ----------- BMF discovery / loading -----------
 def _unzip_in_place(folder: Path):
-    if not folder.exists() or not folder.is_dir(): return
+    if not folder.exists() or not folder.is_dir():
+        return
     for z in folder.glob("*.zip"):
         try:
             with zipfile.ZipFile(z, "r") as zf:
@@ -75,7 +73,6 @@ def _list_bmf_files(bases):
         if base.exists() and base.is_dir():
             for pat in patterns:
                 hits.extend(sorted(base.glob(pat)))
-    # de-dupe
     seen, out = set(), []
     for p in hits:
         rp = str(p.resolve())
@@ -85,10 +82,13 @@ def _list_bmf_files(bases):
     return out
 
 @st.cache_data(show_spinner=False)
-def load_bmf_data(bmf_folder_input: str):
+def scan_bmf(bmf_folder_input: str):
+    """Scan + parse BMF files. Called *on demand* so boot is fast."""
     bmf_folder = Path(bmf_folder_input).expanduser().resolve()
     bases = [bmf_folder, Path.cwd()]
-    for b in bases: _unzip_in_place(b)
+    for b in bases:
+        _unzip_in_place(b)
+
     files = _list_bmf_files(bases)
     files_to_read = [p for p in files if p.suffix.lower() != ".zip"]
 
@@ -117,7 +117,6 @@ def load_bmf_data(bmf_folder_input: str):
     combined.columns = combined.columns.str.lower().str.strip()
     return combined, read_names
 
-# ----------- Upload & Match -----------
 def clean_uploaded(file):
     df = pd.read_csv(file, dtype=str)
     df.columns = df.columns.str.lower().str.strip()
@@ -143,8 +142,15 @@ def dedupe(df, org_col):
         out = out.drop_duplicates(subset=[org_col], keep="first")
     return out
 
-# ----------- ProPublica (async) -----------
-async def fetch_propublica(session, ein):
+# ---- ProPublica (aiohttp OR requests fallback) ----
+USE_AIOHTTP = False
+try:
+    import aiohttp  # type: ignore
+    USE_AIOHTTP = True
+except Exception:
+    import requests  # fallback
+
+async def _fetch_propublica_aiohttp(session, ein):
     try:
         url = f"{PROPUBLICA_API_URL}{ein}.json"
         async with session.get(url, timeout=30) as resp:
@@ -162,73 +168,91 @@ async def fetch_propublica(session, ein):
         pass
     return None
 
+def _fetch_propublica_requests(ein):
+    try:
+        import requests
+        url = f"{PROPUBLICA_API_URL}{ein}.json"
+        r = requests.get(url, timeout=30)
+        if r.status_code == 200:
+            data = r.json()
+            org = data.get("organization", {}) or {}
+            return {
+                "EIN": ein,
+                "Employees": org.get("employee_count", "N/A"),
+                "Website": org.get("website", "N/A"),
+                "Mission": org.get("mission", "N/A"),
+                "990 Link": f"https://projects.propublica.org/nonprofits/organizations/{ein}/full",
+            }
+    except Exception:
+        pass
+    return None
+
 async def enrich_with_propublica(eins):
-    if not eins: return []
-    async with aiohttp.ClientSession() as session:
-        tasks = [fetch_propublica(session, e) for e in eins if e and str(e).strip()]
-        return await asyncio.gather(*tasks) if tasks else []
+    if not eins:
+        return []
+    if USE_AIOHTTP:
+        async with aiohttp.ClientSession() as session:  # type: ignore
+            tasks = [_fetch_propublica_aiohttp(session, e) for e in eins if e and str(e).strip()]
+            return await asyncio.gather(*tasks) if tasks else []
+    # requests fallback – run sync in thread
+    loop = asyncio.get_event_loop()
+    tasks = [loop.run_in_executor(None, _fetch_propublica_requests, e) for e in eins if e and str(e).strip()]
+    return await asyncio.gather(*tasks) if tasks else []
 
 # ================= UI =================
-st.markdown("**Step 1 — Load IRS BMF data** (we scan both `IRS_EO_BMF/` and the repo root).")
+st.markdown("**Step 1 — (Optional) set folder to scan for BMF data**")
+bmf_folder_input = st.text_input("📁 We scan *this* folder and the repo root", value=BMF_DEFAULT_FOLDER)
 
-bmf_folder_input = st.text_input("📁 Optional: specify a folder to scan in addition to repo root", value=BMF_DEFAULT_FOLDER)
-bmf_data, bmf_read_files = load_bmf_data(bmf_folder_input)
-
-with st.expander("🧪 BMF diagnostics", expanded=False):
+with st.expander("🧪 Diagnostics", expanded=False):
     st.write({
         "cwd": os.getcwd(),
-        "scan_folder": str(Path(bmf_folder_input).expanduser().resolve()),
-        "files_loaded": bmf_read_files[:25] + (["..."] if len(bmf_read_files) > 25 else []),
-        "rows_loaded": int(len(bmf_data)) if not bmf_data.empty else 0,
+        "scan_folder_resolved": str(Path(bmf_folder_input).expanduser().resolve()),
     })
 
-bmf_ready = not bmf_data.empty
-if not bmf_ready:
-    st.warning("No BMF files found or parsable yet. We’ll still let you upload your org CSV below; enrichment will wait until BMF is present.")
-
-# Normalize BMF if present (no stop; we keep UI alive)
-bmf_name_col = None
-if bmf_ready:
-    bmf_data = normalize_bmf_columns(bmf_data)
-    bmf_name_col = get_best_name_col(bmf_data.columns)
-    if not bmf_name_col or bmf_name_col not in bmf_data.columns:
-        st.error("Could not infer an organization name column in BMF data.")
-        bmf_ready = False
-    else:
-        st.success(f"BMF ready: {len(bmf_data):,} rows • using name column **{bmf_name_col}**")
-
+# --- Always show org uploader (never block app boot) ---
 st.markdown("---")
 st.markdown("**Step 2 — Upload your org sheet (CSV)**")
-
-uploaded_file = st.file_uploader(
-    "📤 Choose your org CSV",
-    type=["csv"],
-    accept_multiple_files=False,
-    key="org_csv_uploader",
-)
-org_ready = uploaded_file is not None
-
-uploaded_df, org_col = None, None
-if org_ready:
+uploaded_file = st.file_uploader("📤 Choose your org CSV", type=["csv"], key="org_csv")
+uploaded_df, org_col = (None, None)
+if uploaded_file:
     try:
         uploaded_df, org_col = clean_uploaded(uploaded_file)
         st.caption(f"Detected org/name column: **{org_col}**")
         st.dataframe(uploaded_df.head(50), use_container_width=True)
     except Exception as e:
         st.error(f"Could not read your CSV: {e}")
-        org_ready = False
 
+# --- Load BMF on demand (lazy) ---
 st.markdown("---")
-clicked = st.button("🚀 Enrich Now")
+if st.button("📂 Scan BMF files now"):
+    with st.spinner("Scanning & loading BMF data..."):
+        bmf_data, bmf_read_files = scan_bmf(bmf_folder_input)
+    if bmf_data.empty:
+        st.error("No BMF files found or parsable in IRS_EO_BMF/ or repo root.")
+    else:
+        st.success(f"BMF ready: {len(bmf_data):,} rows from {len(bmf_read_files)} file(s).")
+        st.session_state["bmf_ready"] = True
+        st.session_state["bmf_data"] = normalize_bmf_columns(bmf_data)
+        st.session_state["bmf_name_col"] = get_best_name_col(bmf_data.columns)
 
-if clicked:
-    if not org_ready and not bmf_ready:
-        st.error("Please upload your org CSV and ensure BMF data is loaded first.")
-    elif not org_ready:
+# Show BMF status
+bmf_ready = st.session_state.get("bmf_ready", False)
+if bmf_ready:
+    st.info(f"BMF loaded • using name column: **{st.session_state['bmf_name_col']}**")
+else:
+    st.warning("BMF not loaded yet. Click **Scan BMF files now** when ready.")
+
+# --- Enrich ---
+st.markdown("---")
+if st.button("🚀 Enrich Now"):
+    if not uploaded_df is not None or not org_col:
         st.error("Please upload your org CSV first.")
     elif not bmf_ready:
-        st.error("BMF data isn’t ready yet. Add BMF files (eo_*.csv, .csv/.tsv/.txt) to repo root or IRS_EO_BMF/, then rerun.")
+        st.error("Please load BMF data first (click **Scan BMF files now**).")
     else:
+        bmf_data = st.session_state["bmf_data"]
+        bmf_name_col = st.session_state["bmf_name_col"]
+
         st.info("🔎 Matching EINs locally...")
         enriched = match_eins(uploaded_df, org_col, bmf_data, bmf_name_col)
         if "ein" in enriched.columns:
@@ -237,17 +261,17 @@ if clicked:
         eins = enriched["EIN"].dropna().unique().tolist() if "EIN" in enriched.columns else []
         st.info(f"🔗 Found {len(eins)} unique EIN(s) for ProPublica.")
 
-        pro_df = pd.DataFrame()
         if eins:
             with st.spinner("Fetching ProPublica details..."):
+                # Safe even if Streamlit already has a loop; run in a fresh task
                 try:
                     results = asyncio.run(enrich_with_propublica(eins))
-                    pro_df = pd.DataFrame([r for r in results if r])
-                except Exception as e:
-                    st.warning(f"ProPublica enrichment failed: {e}")
-
-        if not pro_df.empty:
-            enriched = enriched.merge(pro_df, on="EIN", how="left")
+                except RuntimeError:
+                    # fallback if event loop is already running
+                    results = asyncio.get_event_loop().run_until_complete(enrich_with_propublica(eins))
+            pro_df = pd.DataFrame([r for r in results if r]) if results else pd.DataFrame()
+            if not pro_df.empty:
+                enriched = enriched.merge(pro_df, on="EIN", how="left")
 
         enriched = dedupe(enriched, org_col)
         st.success("✅ Enrichment complete!")
@@ -259,3 +283,4 @@ if clicked:
             file_name="enriched_data.csv",
             mime="text/csv",
         )
+
