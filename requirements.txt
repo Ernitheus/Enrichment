@@ -1,5 +1,6 @@
 streamlit==1.39.0
 pandas==2.2.2
 numpy==1.26.4
-
-
+requests==2.32.3
+beautifulsoup4==4.12.3
+tldextract==5.1.2
