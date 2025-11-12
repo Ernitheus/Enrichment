@@ -4,3 +4,5 @@ numpy>=1.26
 requests>=2.32
 rapidfuzz>=3.9
 aiohttp>=3.9
+beautifulsoup4>=4.12
+tldextract>=5.1
