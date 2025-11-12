@@ -120,11 +120,17 @@ def dedupe(df, org_col):
     return out
 
 # -------------------- Domain helpers --------------------
+def _safe_str(x) -> str:
+    if x is None: return ""
+    if isinstance(x, float) and pd.isna(x): return ""
+    try:
+        return str(x)
+    except Exception:
+        return ""
+
 def domain_only(url_or_host) -> str:
     try:
-        if url_or_host is None or (isinstance(url_or_host, float) and pd.isna(url_or_host)):
-            return ""
-        s = str(url_or_host).strip()
+        s = _safe_str(url_or_host).strip()
         if not s or s.lower() in {"nan", "none", "null"}:
             return ""
         if "://" not in s:
@@ -137,7 +143,7 @@ def domain_only(url_or_host) -> str:
         return ""
 
 def guess_domain_from_name(name: str) -> str:
-    base = re.sub(r"[^a-z0-9]+", "", name.lower())
+    base = re.sub(r"[^a-z0-9]+", "", _safe_str(name).lower())
     return base + ".org" if base else ""
 
 def http_head_alive(host: str) -> bool:
@@ -145,14 +151,15 @@ def http_head_alive(host: str) -> bool:
     for scheme in ("https://", "http://"):
         try:
             r = requests.head(scheme+host, timeout=HTTP_TIMEOUT_SEC)
-            if r.status_code < 500: return True
+            if r.status_code and r.status_code < 500:
+                return True
         except Exception:
             pass
     return False
 
 def search_duckduckgo_html(query: str) -> list[str]:
     try:
-        r = requests.get("https://duckduckgo.com/html/", params={"q": query}, timeout=HTTP_TIMEOUT_SEC)
+        r = requests.get("https://duckduckgo.com/html/", params={"q": _safe_str(query)}, timeout=HTTP_TIMEOUT_SEC)
         soup = BeautifulSoup(r.text, "html.parser")
         hosts = []
         for a in soup.select("a.result__a"):
@@ -163,17 +170,31 @@ def search_duckduckgo_html(query: str) -> list[str]:
     except Exception:
         return []
 
-def accurate_domain_for_row(name: str, ein: str, city: str, state: str, hint: str) -> str:
+def accurate_domain_for_row(name, ein, city, state, hint) -> str:
+    # coerce all to safe strings
+    name  = _safe_str(name)
+    ein   = _safe_str(ein)
+    city  = _safe_str(city)
+    state = _safe_str(state)
+    hint  = _safe_str(hint)
+
     hint_domain = domain_only(hint)
     if hint_domain and http_head_alive(hint_domain):
         return hint_domain
-    q = " ".join(filter(None, [name, ein, city, state]))
+
+    q = " ".join([t for t in [name, ein and f"EIN {ein}", city, state] if t])
     candidates = search_duckduckgo_html(q)
+
+    # try live candidates first
     for c in candidates:
-        if http_head_alive(c): return c
+        if http_head_alive(c):
+            return c
+
+    # fallback to a guessed domain if it's live
     guess = guess_domain_from_name(name)
-    if http_head_alive(guess): return guess
-    return guess
+    if http_head_alive(guess):
+        return guess
+    return guess  # final fallback (may be non-live, but consistent)
 
 # -------------------- Streamlit UI --------------------
 st.title(APP_TITLE)
@@ -222,25 +243,34 @@ if st.button("🚀 Enrich Now"):
         with st.spinner("Matching EINs..."):
             enriched = match_eins(df, org_col, st.session_state["bmf_data"], st.session_state["bmf_name_col"])
         enriched = dedupe(enriched, org_col)
-        enriched["WebsiteRaw"] = enriched.get("website", "")
+
+        # Website columns
+        enriched["WebsiteRaw"]   = enriched["website"] if "website" in enriched.columns else ""
         enriched["WebsiteGuess"] = enriched[org_col].apply(guess_domain_from_name)
         enriched["WebsiteDomain"] = enriched["WebsiteRaw"].map(domain_only)
 
+        # Accurate mode worklist
         if use_accurate:
-            work = enriched[enriched["WebsiteDomain"] == ""].head(domain_cap)
-            progress = st.progress(0)
-            for i, (idx, row) in enumerate(work.iterrows(), start=1):
-                best = accurate_domain_for_row(
-                    name=row.get(org_col, ""),
-                    ein=row.get("ein", ""),
-                    city=row.get("city", ""),
-                    state=row.get("state", ""),
-                    hint=row.get("WebsiteRaw", ""),
-                )
-                enriched.at[idx, "WebsiteDomain"] = best
-                progress.progress(int(i * 100 / len(work)))
-                time.sleep(REQUEST_DELAY_SEC)
-            progress.empty()
+            work = enriched[enriched["WebsiteDomain"] == ""].head(int(domain_cap))
+            total = len(work)
+            if total > 0:
+                progress = st.progress(0)
+                for i, (idx, row) in enumerate(work.iterrows(), start=1):
+                    best = ""
+                    try:
+                        best = accurate_domain_for_row(
+                            name=row.get(org_col, ""),
+                            ein=row.get("ein", "") or row.get("EIN", ""),
+                            city=row.get("city", ""),
+                            state=row.get("state", ""),
+                            hint=row.get("WebsiteRaw", ""),
+                        )
+                    except Exception:
+                        best = enriched.at[idx, "WebsiteGuess"]
+                    enriched.at[idx, "WebsiteDomain"] = best or enriched.at[idx, "WebsiteGuess"]
+                    progress.progress(int(i * 100 / max(1, total)))
+                    time.sleep(REQUEST_DELAY_SEC)
+                progress.empty()
 
         st.success("✅ Enrichment complete!")
         st.dataframe(enriched.head(MAX_PREVIEW_ROWS))
