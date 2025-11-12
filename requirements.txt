@@ -1,6 +1,6 @@
-streamlit
-pandas
-aiohttp
-requests
-fuzzywuzzy
-python-Levenshtein
+streamlit>=1.38
+pandas>=2.2
+numpy>=1.26
+requests>=2.32
+rapidfuzz>=3.9
+aiohttp>=3.9
